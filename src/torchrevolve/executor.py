@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 from torch import Tensor
 
 from torchrevolve.chain import BlockChain, ChainProfile, UnitProfile
+from torchrevolve.memmodel import TransformerShape, transformer_activation_bytes
 from torchrevolve.schedules import Schedule
 
 
@@ -32,6 +33,13 @@ class _Snapshot:
     rng: _RNGState
 
 
+@dataclass(frozen=True)
+class _Tape:
+    inputs: Tensor
+    output: Tensor
+    rng: _RNGState
+
+
 def run_scheduled_backward(
     chain: BlockChain,
     schedule: Schedule,
@@ -39,6 +47,8 @@ def run_scheduled_backward(
     loss_fn: Callable[..., Tensor],
     *,
     replay_rng: bool = True,
+    set_to_none: bool = True,
+    capture_gradients: bool = True,
 ) -> GradResult:
     """Run a scheduled forward and backward pass; gradients land in ``.grad``."""
     if not hasattr(chain.model, "prepare_inputs") or not hasattr(chain.model, "finish"):
@@ -48,11 +58,12 @@ def run_scheduled_backward(
     profile = _validation_profile(chain, model_inputs)
     schedule.validate(profile).require_valid()
 
-    chain.model.zero_grad(set_to_none=True)
+    chain.model.zero_grad(set_to_none=set_to_none)
     original_input = chain.model.prepare_inputs(model_inputs)
     current = original_input.detach()
     current_rng = _capture_rng(device)
     snapshots = {0: _Snapshot(current, current_rng)}
+    kept_tapes: dict[int, _Tape] = {}
     first_forward = [True] * len(chain.units)
     live_input: Tensor | None = None
     live_output: Tensor | None = None
@@ -78,17 +89,33 @@ def run_scheduled_backward(
             forward_evaluations += 1
             if action.kind == "forward_store" and unit + 1 < len(chain.units):
                 snapshots[unit + 1] = _Snapshot(current.detach(), current_rng)
+            elif action.kind == "forward_keep":
+                kept_tapes[unit] = _Tape(live_input, live_output, current_rng)
         elif action.kind == "restore":
-            snapshot = snapshots[action.unit]
-            current = snapshot.value
-            current_rng = snapshot.rng
+            if action.unit in snapshots:
+                snapshot = snapshots[action.unit]
+                current = snapshot.value
+                current_rng = snapshot.rng
+            elif action.unit > 0 and action.unit - 1 in kept_tapes:
+                tape = kept_tapes[action.unit - 1]
+                current = tape.output.detach()
+                current_rng = tape.rng
+            else:
+                raise RuntimeError(f"state {action.unit} is not retained")
             live_input = None
             live_output = None
         elif action.kind == "backward":
-            if live_input is None or live_output is None:
+            if unit in kept_tapes:
+                tape = kept_tapes.pop(unit)
+                backward_input = tape.inputs
+                backward_output = tape.output
+            elif live_input is not None and live_output is not None:
+                backward_input = live_input
+                backward_output = live_output
+            else:
                 raise RuntimeError(f"backward {unit} has no live forward graph")
             if unit == len(chain.units) - 1 and loss is None:
-                logits = chain.model.finish(live_output)
+                logits = chain.model.finish(backward_output)
                 loss = loss_fn(logits, *loss_args)
                 if loss.ndim != 0:
                     raise ValueError("loss_fn must return a scalar tensor")
@@ -96,11 +123,11 @@ def run_scheduled_backward(
             else:
                 if adjoint is None:
                     raise RuntimeError("missing adjoint for scheduled backward")
-                torch.autograd.backward(live_output, adjoint)
-            if live_input.grad is None:
+                torch.autograd.backward(backward_output, adjoint)
+            if backward_input.grad is None:
                 raise RuntimeError(f"unit {unit} did not produce an input gradient")
-            adjoint = live_input.grad.detach()
-            current = live_input.detach()
+            adjoint = backward_input.grad.detach()
+            current = backward_input.detach()
             live_input = None
             live_output = None
             snapshots.pop(unit, None)
@@ -108,11 +135,15 @@ def run_scheduled_backward(
     if loss is None or adjoint is None:
         raise RuntimeError("schedule did not complete the backward sweep")
     original_input.backward(adjoint)
-    gradients = {
-        name: parameter.grad.detach().clone()
-        for name, parameter in chain.model.named_parameters()
-        if parameter.grad is not None
-    }
+    gradients = (
+        {
+            name: parameter.grad.detach().clone()
+            for name, parameter in chain.model.named_parameters()
+            if parameter.grad is not None
+        }
+        if capture_gradients
+        else {}
+    )
     n_units = len(chain.units)
     return GradResult(
         loss=loss.detach().clone(),
@@ -122,7 +153,9 @@ def run_scheduled_backward(
     )
 
 
-def _split_batch(batch: Tensor | tuple[Tensor, ...]) -> tuple[Tensor, tuple[Tensor, ...]]:
+def _split_batch(
+    batch: Tensor | tuple[Tensor, ...],
+) -> tuple[Tensor, tuple[Tensor, ...]]:
     if isinstance(batch, Tensor):
         return batch, ()
     if not batch or not all(isinstance(item, Tensor) for item in batch):
@@ -132,15 +165,38 @@ def _split_batch(batch: Tensor | tuple[Tensor, ...]) -> tuple[Tensor, tuple[Tens
 
 def _validation_profile(chain: BlockChain, inputs: Tensor) -> ChainProfile:
     model_dtype = next(chain.model.parameters()).dtype
-    width = getattr(chain.model.config, "width", 1)
+    config = chain.model.config
+    width = getattr(config, "width", 1)
     state_bytes = inputs.shape[0] * inputs.shape[1] * width * model_dtype.itemsize
+    breakdown = transformer_activation_bytes(
+        TransformerShape(
+            inputs.shape[0],
+            inputs.shape[1],
+            width,
+            config.heads,
+            config.mlp_ratio,
+        ),
+        model_dtype,
+    )
+
+    def activation_bytes(kind: str) -> int:
+        if kind == "block":
+            return breakdown.total
+        residual_share = breakdown.norms_and_residuals // 2
+        if kind == "attention":
+            return breakdown.attention + residual_share
+        return breakdown.mlp + residual_share
+
     units = tuple(
         UnitProfile(
             name=unit.name,
             forward_seconds=0.0,
-            activation_bytes=state_bytes,
-            parameter_count=sum(parameter.numel() for parameter in unit.module.parameters()),
+            activation_bytes=activation_bytes(unit.kind),
+            parameter_count=sum(
+                parameter.numel() for parameter in unit.module.parameters()
+            ),
             kind=unit.kind,
+            state_bytes=state_bytes,
         )
         for unit in chain.units
     )

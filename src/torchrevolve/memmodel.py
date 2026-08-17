@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import gc
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 import torch
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,15 @@ class ActivationBreakdown:
     @property
     def total(self) -> int:
         return self.attention + self.mlp + self.norms_and_residuals
+
+
+@dataclass(frozen=True)
+class MemoryValidation:
+    predicted_bytes: int
+    measured_bytes: int
+    relative_error: float
+    within_tolerance: bool
+    device_type: str
 
 
 def dtype_size(dtype: torch.dtype) -> int:
@@ -63,3 +77,84 @@ def transformer_activation_bytes(
         norms_and_residuals=norm_residual_elements * itemsize,
     )
 
+
+def allocator_available(device: str | torch.device) -> bool:
+    target = torch.device(device)
+    if target.type == "cuda":
+        return torch.cuda.is_available()
+    if target.type == "mps":
+        return torch.backends.mps.is_available()
+    return False
+
+
+def measure_allocator_delta(
+    operation: Callable[[], T],
+    *,
+    device: str | torch.device,
+) -> tuple[T, int]:
+    target = torch.device(device)
+    if not allocator_available(target):
+        raise RuntimeError(f"allocator counters are unavailable for {target.type}")
+    gc.collect()
+    if target.type == "cuda":
+        torch.cuda.synchronize(target)
+        torch.cuda.empty_cache()
+        baseline = torch.cuda.memory_allocated(target)
+        torch.cuda.reset_peak_memory_stats(target)
+        result = operation()
+        torch.cuda.synchronize(target)
+        peak = torch.cuda.max_memory_allocated(target)
+    else:
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+        baseline = torch.mps.current_allocated_memory()
+        result = operation()
+        torch.mps.synchronize()
+        peak = torch.mps.current_allocated_memory()
+    return result, max(0, peak - baseline)
+
+
+def measure_saved_activation_bytes(
+    module: torch.nn.Module,
+    operation: Callable[[], T],
+) -> tuple[T, int]:
+    parameter_storages = {
+        parameter.untyped_storage().data_ptr() for parameter in module.parameters()
+    }
+    saved_bytes = 0
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal saved_bytes
+        if tensor.untyped_storage().data_ptr() not in parameter_storages:
+            saved_bytes += tensor.numel() * tensor.element_size()
+        return tensor
+
+    def unpack(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        result = operation()
+    return result, saved_bytes
+
+
+def validate_allocator_measurement(
+    shape: TransformerShape,
+    measured_bytes: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device_type: str,
+    tolerance: float = 0.1,
+) -> MemoryValidation:
+    if measured_bytes < 0:
+        raise ValueError("measured_bytes cannot be negative")
+    if tolerance < 0:
+        raise ValueError("tolerance cannot be negative")
+    predicted = transformer_activation_bytes(shape, dtype).total
+    relative_error = abs(measured_bytes - predicted) / max(1, predicted)
+    return MemoryValidation(
+        predicted_bytes=predicted,
+        measured_bytes=measured_bytes,
+        relative_error=relative_error,
+        within_tolerance=relative_error <= tolerance,
+        device_type=device_type,
+    )

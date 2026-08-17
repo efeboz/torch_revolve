@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
+from torchrevolve.chain import BlockChain, ChainProfile
+from torchrevolve.executor import run_scheduled_backward
 from torchrevolve.model import TinyGPT, TinyGPTConfig
+from torchrevolve.schedules import Schedule
 
 
 @dataclass(frozen=True)
@@ -53,5 +57,63 @@ def train_baseline(
         loss.backward()
         optimizer.step()
         losses.append(loss.detach().cpu().item())
-    state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+    return TrainingTrace(losses=tuple(losses), state=state)
+
+
+def train_scheduled(
+    config: TinyGPTConfig,
+    schedule_fn: Callable[[ChainProfile], Schedule],
+    *,
+    granularity: str = "coarse",
+    steps: int = 10,
+    batch_size: int = 2,
+    sequence_length: int = 16,
+    learning_rate: float = 1e-3,
+    seed: int = 0,
+    device: str | torch.device = "cpu",
+) -> TrainingTrace:
+    if steps <= 0 or batch_size <= 0 or sequence_length <= 0:
+        raise ValueError("steps, batch_size, and sequence_length must be positive")
+    if sequence_length > config.max_sequence_length:
+        raise ValueError("sequence length exceeds model configuration")
+    configure_determinism(seed)
+    target_device = torch.device(device)
+    model = TinyGPT(config).to(target_device)
+    chain = BlockChain.from_model(model, granularity=granularity)
+    example = torch.zeros(
+        batch_size, sequence_length, dtype=torch.long, device=target_device
+    )
+    schedule = schedule_fn(chain.profile(example, device=target_device, n_reps=1))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    data_generator = torch.Generator(device=target_device).manual_seed(seed + 1)
+    losses = []
+
+    def loss_fn(logits: Tensor, targets: Tensor) -> Tensor:
+        return torch.nn.functional.cross_entropy(
+            logits.flatten(0, 1), targets.flatten()
+        )
+
+    for _ in range(steps):
+        tokens = torch.randint(
+            config.vocab_size,
+            (batch_size, sequence_length + 1),
+            generator=data_generator,
+            device=target_device,
+        )
+        result = run_scheduled_backward(
+            chain,
+            schedule,
+            (tokens[:, :-1], tokens[:, 1:]),
+            loss_fn,
+        )
+        optimizer.step()
+        losses.append(result.loss.cpu().item())
+    state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
     return TrainingTrace(losses=tuple(losses), state=state)

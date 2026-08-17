@@ -54,12 +54,16 @@ class CausalSelfAttention(nn.Module):
         query, key, value = qkv.chunk(3, dim=-1)
 
         def split_heads(tensor: Tensor) -> Tensor:
-            return tensor.view(batch, length, self.heads, self.head_width).transpose(1, 2)
+            return tensor.view(batch, length, self.heads, self.head_width).transpose(
+                1, 2
+            )
 
         query, key, value = map(split_heads, (query, key, value))
         scores = query @ key.transpose(-2, -1)
         scores = scores * (1.0 / math.sqrt(self.head_width))
-        causal = torch.ones(length, length, device=inputs.device, dtype=torch.bool).tril()
+        causal = torch.ones(
+            length, length, device=inputs.device, dtype=torch.bool
+        ).tril()
         scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
         probabilities = self.attention_dropout(F.softmax(scores, dim=-1))
         context = probabilities @ value
@@ -108,7 +112,9 @@ class TinyGPT(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.width)
         self.position_embedding = nn.Embedding(config.max_sequence_length, config.width)
         self.embedding_dropout = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.depth))
+        self.blocks = nn.ModuleList(
+            TransformerBlock(config) for _ in range(config.depth)
+        )
         self.final_norm = nn.LayerNorm(config.width)
         self.lm_head = nn.Linear(config.width, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
@@ -128,7 +134,9 @@ class TinyGPT(nn.Module):
         if length > self.config.max_sequence_length:
             raise ValueError("sequence length exceeds model configuration")
         positions = torch.arange(length, device=token_ids.device)
-        embeddings = self.token_embedding(token_ids) + self.position_embedding(positions)
+        embeddings = self.token_embedding(token_ids) + self.position_embedding(
+            positions
+        )
         return self.embedding_dropout(embeddings)
 
     def finish(self, hidden: Tensor) -> Tensor:
@@ -144,4 +152,3 @@ class TinyGPT(nn.Module):
         if targets.shape != token_ids.shape:
             raise ValueError("targets must have the same shape as token_ids")
         return F.cross_entropy(logits.flatten(0, 1), targets.flatten())
-

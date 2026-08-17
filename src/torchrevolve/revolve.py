@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from functools import lru_cache
+from functools import cache
 
 from torchrevolve.chain import ChainProfile
 from torchrevolve.schedules import (
@@ -43,7 +43,7 @@ def combinatorial_recomputations(n_steps: int, snapshots: int) -> int:
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def minimum_recomputations(n_steps: int, snapshots: int) -> int:
     if n_steps <= 0:
         raise ValueError("n_steps must be positive")
@@ -140,4 +140,3 @@ def _recompute_cost(actions: list[Action], profile: ChainProfile) -> float:
         max(0, count - 1) * unit.forward_seconds
         for count, unit in zip(counts, profile.units, strict=True)
     )
-

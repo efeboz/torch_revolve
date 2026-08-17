@@ -12,7 +12,6 @@ from torch import Tensor, nn
 
 from torchrevolve.memmodel import TransformerShape, transformer_activation_bytes
 
-
 UnitKind = Literal["block", "attention", "mlp"]
 
 
@@ -23,6 +22,7 @@ class UnitProfile:
     activation_bytes: int
     parameter_count: int
     kind: UnitKind = "block"
+    state_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.forward_seconds < 0:
@@ -31,6 +31,12 @@ class UnitProfile:
             raise ValueError("activation_bytes cannot be negative")
         if self.parameter_count < 0:
             raise ValueError("parameter_count cannot be negative")
+        if self.state_bytes < 0:
+            raise ValueError("state_bytes cannot be negative")
+
+    @property
+    def effective_state_bytes(self) -> int:
+        return self.state_bytes or self.activation_bytes
 
 
 @dataclass(frozen=True)
@@ -83,10 +89,12 @@ class BlockChain:
         model: nn.Module,
         *,
         granularity: Literal["coarse", "fine"] = "coarse",
-    ) -> "BlockChain":
+    ) -> BlockChain:
         blocks = getattr(model, "blocks", None)
         if not isinstance(blocks, nn.ModuleList) or not blocks:
-            raise TypeError("model must expose a non-empty nn.ModuleList named 'blocks'")
+            raise TypeError(
+                "model must expose a non-empty nn.ModuleList named 'blocks'"
+            )
         if granularity == "coarse":
             units = tuple(
                 ChainUnit(name=f"block.{index}", module=block, kind="block")
@@ -95,8 +103,12 @@ class BlockChain:
         elif granularity == "fine":
             expanded: list[ChainUnit] = []
             for index, block in enumerate(blocks):
-                if not hasattr(block, "attention_unit") or not hasattr(block, "mlp_unit"):
-                    raise TypeError("fine granularity requires attention_unit and mlp_unit")
+                if not hasattr(block, "attention_unit") or not hasattr(
+                    block, "mlp_unit"
+                ):
+                    raise TypeError(
+                        "fine granularity requires attention_unit and mlp_unit"
+                    )
                 expanded.extend(
                     (
                         ChainUnit(
@@ -126,8 +138,12 @@ class BlockChain:
         if n_reps <= 0:
             raise ValueError("n_reps must be positive")
         if batch.ndim != 2:
-            raise ValueError("batch must contain token ids with shape (batch, sequence)")
-        if not hasattr(self.model, "prepare_inputs") or not hasattr(self.model, "config"):
+            raise ValueError(
+                "batch must contain token ids with shape (batch, sequence)"
+            )
+        if not hasattr(self.model, "prepare_inputs") or not hasattr(
+            self.model, "config"
+        ):
             raise TypeError("model must expose prepare_inputs and config")
 
         target_device = torch.device(device)
@@ -141,7 +157,15 @@ class BlockChain:
             heads=config.heads,
             mlp_ratio=config.mlp_ratio,
         )
-        breakdown = transformer_activation_bytes(shape, next(self.model.parameters()).dtype)
+        breakdown = transformer_activation_bytes(
+            shape, next(self.model.parameters()).dtype
+        )
+        state_bytes = (
+            tokens.shape[0]
+            * tokens.shape[1]
+            * config.width
+            * next(self.model.parameters()).element_size()
+        )
         was_training = self.model.training
         self.model.eval()
         with torch.inference_mode():
@@ -164,8 +188,11 @@ class BlockChain:
                         name=unit.name,
                         forward_seconds=statistics.median(samples),
                         activation_bytes=activation_bytes,
-                        parameter_count=sum(p.numel() for p in unit.module.parameters()),
+                        parameter_count=sum(
+                            p.numel() for p in unit.module.parameters()
+                        ),
                         kind=unit.kind,
+                        state_bytes=state_bytes,
                     )
                 )
                 hidden = output
@@ -193,4 +220,3 @@ class BlockChain:
             torch.cuda.synchronize(device)
         elif device.type == "mps":
             torch.mps.synchronize()
-
