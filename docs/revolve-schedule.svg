@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="210" viewBox="0 0 760 210" role="img" aria-labelledby="title description">
+  <title id="title">Example revolve schedule</title>
+  <desc id="description">Forward, store, restore, and backward actions across four chain units.</desc>
+  <rect width="760" height="210" fill="#ffffff"/>
+  <g font-family="system-ui, sans-serif" font-size="12" fill="#0f172a">
+    <text x="12" y="32">unit 0</text><text x="12" y="70">unit 1</text>
+    <text x="12" y="108">unit 2</text><text x="12" y="146">unit 3</text>
+    <text x="90" y="190">time / action index →</text>
+  </g>
+  <g stroke="#e2e8f0"><path d="M75 28H740M75 66H740M75 104H740M75 142H740"/></g>
+  <g fill="#94a3b8">
+    <circle cx="100" cy="28" r="7"/><circle cx="160" cy="66" r="7"/>
+    <circle cx="220" cy="104" r="7"/><circle cx="280" cy="142" r="7"/>
+    <circle cx="460" cy="28" r="7"/><circle cx="580" cy="66" r="7"/>
+  </g>
+  <g fill="#2563eb"><rect x="123" y="21" width="14" height="14"/><rect x="363" y="97" width="14" height="14"/></g>
+  <g fill="#d97706"><path d="M330 21l-12 7 12 7z"/><path d="M430 21l-12 7 12 7z"/><path d="M550 59l-12 7 12 7z"/></g>
+  <g stroke="#dc2626" stroke-width="3">
+    <path d="M300 135l14 14m0-14l-14 14M390 97l14 14m0-14l-14 14M490 21l14 14m0-14l-14 14M610 59l14 14m0-14l-14 14"/>
+  </g>
+  <g font-family="system-ui, sans-serif" font-size="11">
+    <circle cx="90" cy="174" r="6" fill="#94a3b8"/><text x="102" y="178">forward/drop</text>
+    <rect x="205" y="168" width="12" height="12" fill="#2563eb"/><text x="225" y="178">store</text>
+    <path d="M300 168l-10 6 10 6z" fill="#d97706"/><text x="307" y="178">restore</text>
+    <path d="M380 168l12 12m0-12l-12 12" stroke="#dc2626" stroke-width="3"/><text x="400" y="178">backward</text>
+  </g>
+</svg>

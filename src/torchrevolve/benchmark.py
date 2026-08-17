@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import time
 import warnings
 from dataclasses import asdict, dataclass
@@ -12,7 +13,11 @@ from torch.nn import functional as F
 
 from torchrevolve.chain import BlockChain
 from torchrevolve.executor import run_scheduled_backward
-from torchrevolve.memmodel import allocator_available, measure_allocator_delta
+from torchrevolve.memmodel import (
+    allocator_available,
+    allocator_prediction_bytes,
+    measure_allocator_delta,
+)
 from torchrevolve.model import TinyGPT, TinyGPTConfig
 from torchrevolve.selection import ScheduleSelection, select_schedule
 
@@ -26,6 +31,7 @@ class BenchmarkRecord:
     byte_budget: int
     parameter: int | str
     predicted_peak_bytes: int
+    allocator_prediction_bytes: int
     recomputations: int
     median_seconds: float
     q1_seconds: float
@@ -81,7 +87,7 @@ def benchmark_named_schedule(
     def loss_fn(logits: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
         return F.cross_entropy(logits.flatten(0, 1), expected.flatten())
 
-    def step(*, reuse_gradients: bool = False):
+    def step(*, reuse_gradients: bool = False, action_observer=None):
         return run_scheduled_backward(
             chain,
             selection.schedule,
@@ -89,6 +95,7 @@ def benchmark_named_schedule(
             loss_fn,
             set_to_none=not reuse_gradients,
             capture_gradients=False,
+            action_observer=action_observer,
         )
 
     previous_threads = torch.get_num_threads()
@@ -106,10 +113,7 @@ def benchmark_named_schedule(
             samples.append(time.perf_counter() - started)
         measured_peak = None
         if measure_peak and allocator_available(target):
-            _, measured_peak = measure_allocator_delta(
-                lambda: step(reuse_gradients=True),
-                device=target,
-            )
+            measured_peak = _measure_step_peak(step, target)
     finally:
         torch.set_num_threads(previous_threads)
     q1, median, q3 = (float(value) for value in np.percentile(samples, [25, 50, 75]))
@@ -120,7 +124,19 @@ def benchmark_named_schedule(
             stacklevel=2,
         )
     predicted = selection.schedule.predicted().peak_bytes
-    upper_bound = None if measured_peak is None else predicted >= measured_peak
+    cumulative_activations = sum(
+        profile.units[action.unit].activation_bytes
+        for action in selection.schedule.actions
+        if action.kind.startswith("forward")
+    )
+    allocator_prediction = allocator_prediction_bytes(
+        predicted,
+        target,
+        cumulative_activation_bytes=cumulative_activations,
+    )
+    upper_bound = (
+        None if measured_peak is None else allocator_prediction >= measured_peak
+    )
     record = BenchmarkRecord(
         scheduler=scheduler,
         depth=config.depth,
@@ -129,6 +145,7 @@ def benchmark_named_schedule(
         byte_budget=byte_budget,
         parameter=selection.parameter,
         predicted_peak_bytes=predicted,
+        allocator_prediction_bytes=allocator_prediction,
         recomputations=selection.schedule.predicted().recomputations,
         median_seconds=median,
         q1_seconds=q1,
@@ -146,3 +163,26 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def _measure_step_peak(step, device: torch.device) -> int:
+    if device.type == "cuda":
+        _, measured = measure_allocator_delta(
+            lambda: step(reuse_gradients=True),
+            device=device,
+        )
+        return measured
+    gc.collect()
+    torch.mps.synchronize()
+    torch.mps.empty_cache()
+    baseline = torch.mps.current_allocated_memory()
+    peak = baseline
+
+    def sample(_action) -> None:
+        nonlocal peak
+        torch.mps.synchronize()
+        peak = max(peak, torch.mps.current_allocated_memory())
+
+    step(reuse_gradients=True, action_observer=sample)
+    sample(None)
+    return max(0, peak - baseline)

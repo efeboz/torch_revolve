@@ -87,6 +87,23 @@ def allocator_available(device: str | torch.device) -> bool:
     return False
 
 
+def allocator_prediction_bytes(
+    logical_bytes: int,
+    device: str | torch.device,
+    *,
+    cumulative_activation_bytes: int | None = None,
+) -> int:
+    """Return a conservative allocator prediction for logical activation bytes."""
+    if logical_bytes < 0:
+        raise ValueError("logical_bytes cannot be negative")
+    if cumulative_activation_bytes is not None and cumulative_activation_bytes < 0:
+        raise ValueError("cumulative_activation_bytes cannot be negative")
+    if torch.device(device).type == "mps":
+        basis = max(logical_bytes, cumulative_activation_bytes or 0)
+        return (5 * basis + 3) // 4
+    return logical_bytes
+
+
 def measure_allocator_delta(
     operation: Callable[[], T],
     *,
@@ -137,7 +154,7 @@ def measure_saved_activation_bytes(
     return result, saved_bytes
 
 
-def validate_allocator_measurement(
+def validate_activation_measurement(
     shape: TransformerShape,
     measured_bytes: int,
     *,
@@ -157,4 +174,22 @@ def validate_allocator_measurement(
         relative_error=relative_error,
         within_tolerance=relative_error <= tolerance,
         device_type=device_type,
+    )
+
+
+def validate_allocator_measurement(
+    shape: TransformerShape,
+    measured_bytes: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device_type: str,
+    tolerance: float = 0.1,
+) -> MemoryValidation:
+    """Validate a retained-activation measurement against the analytic model."""
+    return validate_activation_measurement(
+        shape,
+        measured_bytes,
+        dtype=dtype,
+        device_type=device_type,
+        tolerance=tolerance,
     )

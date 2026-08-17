@@ -70,4 +70,3 @@ def test_generated_schedule_is_legal_and_matches_cost(
 def test_invalid_revolve_arguments(n_steps: int, snapshots: int) -> None:
     with pytest.raises(ValueError):
         minimum_recomputations(n_steps, snapshots)
-

@@ -10,7 +10,7 @@ from torch import Tensor
 
 from torchrevolve.chain import BlockChain, ChainProfile, UnitProfile
 from torchrevolve.memmodel import TransformerShape, transformer_activation_bytes
-from torchrevolve.schedules import Schedule
+from torchrevolve.schedules import Action, Schedule
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,7 @@ def run_scheduled_backward(
     replay_rng: bool = True,
     set_to_none: bool = True,
     capture_gradients: bool = True,
+    action_observer: Callable[[Action], None] | None = None,
 ) -> GradResult:
     """Run a scheduled forward and backward pass; gradients land in ``.grad``."""
     if not hasattr(chain.model, "prepare_inputs") or not hasattr(chain.model, "finish"):
@@ -131,6 +132,8 @@ def run_scheduled_backward(
             live_input = None
             live_output = None
             snapshots.pop(unit, None)
+        if action_observer is not None:
+            action_observer(action)
 
     if loss is None or adjoint is None:
         raise RuntimeError("schedule did not complete the backward sweep")

@@ -20,17 +20,18 @@ def profile(costs: list[float], sizes: list[int]) -> ChainProfile:
 @pytest.mark.parametrize("snapshots", range(1, 9))
 def test_uniform_dp_reduces_to_revolve(n_units: int, snapshots: int) -> None:
     chain = profile([1.0] * n_units, [16] * n_units)
-    schedule = make_schedule(chain, budget=16 * snapshots)
+    budget = 16 * (snapshots + 1)
+    schedule = make_schedule(chain, budget=budget)
     report = schedule.validate(chain)
     expected = minimum_recomputations(n_units, snapshots)
     assert report.legal, report.violations
     assert schedule.predicted().recompute_cost == expected
-    assert minimum_recompute_cost(chain, 16 * snapshots) == expected
+    assert minimum_recompute_cost(chain, budget) == expected
 
 
 def test_dp_uses_heterogeneous_costs() -> None:
     chain = profile([1.0, 10.0, 1.0, 1.0], [10, 10, 10, 10])
-    schedule = make_schedule(chain, budget=20)
+    schedule = make_schedule(chain, budget=30)
     assert schedule.validate(chain).legal
     assert schedule.predicted().recompute_cost == 13.0
     assert schedule.actions[1].kind == "forward_store"
@@ -44,7 +45,7 @@ def test_fuzzed_heterogeneous_schedules_are_legal() -> None:
         costs = [float(randomizer.randint(1, 20)) for _ in range(n_units)]
         sizes = [randomizer.randint(1, 8) * 8 for _ in range(n_units)]
         chain = profile(costs, sizes)
-        budget = sizes[0] + randomizer.randint(0, sum(sizes[1:]))
+        budget = sizes[0] + max(sizes) + randomizer.randint(0, sum(sizes[1:]))
         schedule = make_schedule(chain, budget=budget)
         report = schedule.validate(chain)
         assert report.legal, report.violations

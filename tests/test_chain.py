@@ -30,7 +30,9 @@ def test_coarse_chain_profile() -> None:
 def test_fine_profile_sums_to_coarse_memory() -> None:
     tokens = torch.zeros(2, 8, dtype=torch.long)
     model = make_model()
-    coarse = BlockChain.from_model(model, granularity="coarse").profile(tokens, n_reps=1)
+    coarse = BlockChain.from_model(model, granularity="coarse").profile(
+        tokens, n_reps=1
+    )
     fine = BlockChain.from_model(model, granularity="fine").profile(tokens, n_reps=1)
     assert len(fine.units) == 4
     assert [unit.kind for unit in fine.units] == ["attention", "mlp"] * 2
